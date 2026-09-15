@@ -9,7 +9,7 @@
 //! ignoring a code-fence line):
 //!
 //! ```text
-//! path/to/file.rs
+//! src/lib.rs
 //! <<<<<<< SEARCH
 //! old code (empty => create a new file)
 //! =======
@@ -182,12 +182,245 @@ fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
     Ok(root.join(rel_path))
 }
 
+/// Directory names never indexed for path resolution (mirrors sandbox skips).
+const RESOLVE_SKIP_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".damascus",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    ".next",
+    ".cargo",
+    "__pycache__",
+];
+
+/// Filenames that are virtually always model-invented placeholders, never real
+/// repo files a step would target.
+const PLACEHOLDER_FILENAMES: &[&str] = &[
+    "file.ext",
+    "file.txt",
+    "filename.ext",
+    "example.py",
+    "example.rs",
+    "example.js",
+    "example.ts",
+    "foo.py",
+    "foo.rs",
+    "foo.js",
+    "bar.py",
+    "bar.rs",
+    "your_file.py",
+    "yourfile.py",
+    "myfile.py",
+];
+
+/// True when `p` (already normalized) looks like an invented example path
+/// rather than a real repo file. Weak models copy prompt examples verbatim
+/// (`path/to/...`), so this is checked before anything touches disk.
+fn looks_like_placeholder(p: &str) -> bool {
+    let l = p.to_ascii_lowercase();
+    if l.contains("path/to")
+        || l.contains("path\\to")
+        || l.contains('<')
+        || l.contains('>')
+        || l.contains("...")
+        || l.contains('*')
+        || l.contains('?')
+    {
+        return true;
+    }
+    // A leading foo/bar/baz segment is example-speak, not a repo layout.
+    if let Some(first) = l.split('/').next() {
+        if matches!(first, "foo" | "bar" | "baz") {
+            return true;
+        }
+    }
+    if let Some(name) = l.rsplit('/').next() {
+        if PLACEHOLDER_FILENAMES.contains(&name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Normalize a model-emitted path: trim decorations, unify separators,
+/// drop `./` prefixes and duplicate slashes. Pure string surgery, no I/O.
+fn normalize_model_path(raw: &str) -> String {
+    let mut p = raw.trim().to_string();
+    p = p
+        .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+        .to_string();
+    p = p.trim_end_matches(':').trim().to_string();
+    p = p.replace('\\', "/");
+    while p.starts_with("./") {
+        p = p[2..].to_string();
+    }
+    while p.contains("//") {
+        p = p.replace("//", "/");
+    }
+    p
+}
+
+/// List repo files (relative, `/`-separated), skipping heavy/derived dirs.
+/// Bounded so pathological trees can't stall the loop.
+fn repo_files(root: &Path) -> Vec<String> {
+    const CAP: usize = 5000;
+    let mut out = Vec::new();
+    let mut walker = walkdir::WalkDir::new(root).into_iter();
+    // walkdir is a hard dependency (see sandbox.rs); filter manually here.
+    while let Some(entry) = walker.next() {
+        if out.len() >= CAP {
+            break;
+        }
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if path != root && RESOLVE_SKIP_DIRS.contains(&name) {
+                    walker.skip_current_dir();
+                }
+            }
+            continue;
+        }
+        if entry.file_type().is_file() {
+            // Forward slashes on every OS (see `crate::rel_forward`).
+            out.push(crate::rel_forward(root, path));
+        }
+    }
+    out
+}
+
+/// Resolve a model-emitted path to the canonical repo-relative path.
+///
+/// - Normalizes separators/decorations (`src\\main.rs`, `./x`, backticks).
+/// - Rejects placeholder paths (`path/to/...`, `<...>`, globs) with an
+///   actionable error that feeds the repair loop.
+/// - For modifications (non-empty SEARCH) the target must exist: exact hit
+///   wins, otherwise a unique suffix match (`path/to/solution.py` →
+///   `solution.py`) is adopted; ambiguous/missing targets error with hints.
+/// - For creations (empty SEARCH) the normalized path is kept as-is so new
+///   files still work.
+pub fn resolve_model_path(root: &Path, raw: &str, is_create: bool) -> Result<String> {
+    let norm = normalize_model_path(raw);
+    if norm.is_empty() {
+        bail!("empty file path in edit block; give the exact repo-relative path");
+    }
+    if norm.ends_with('/') {
+        bail!(
+            "`{raw}` is a directory, not a file; give the exact repo-relative file path"
+        );
+    }
+    if looks_like_placeholder(&norm) {
+        bail!(
+            "path `{raw}` looks like a placeholder, not a real repo file. \
+             Use the EXACT repo-relative path shown in your context (e.g. `solution.py`), \
+             never `path/to/...`, `<...>`, or example filenames"
+        );
+    }
+    let rel = Path::new(&norm);
+    if rel.is_absolute() {
+        bail!("refusing absolute path `{raw}`; use a repo-relative path");
+    }
+    for c in rel.components() {
+        if matches!(c, Component::ParentDir) {
+            bail!("refusing path with `..`: `{raw}`; stay inside the repo");
+        }
+    }
+    let abs = root.join(rel);
+    if abs.is_dir() {
+        bail!("`{raw}` is a directory; give the exact repo-relative file path");
+    }
+    if abs.is_file() {
+        return Ok(norm);
+    }
+    if is_create {
+        // Genuinely new file: keep the normalized path so creation works.
+        return Ok(norm);
+    }
+    // Modification of a path that doesn't exist: try suffix resolution.
+    let files = repo_files(root);
+    let suffix = format!("/{norm}");
+    let mut hits: Vec<&String> = files
+        .iter()
+        .filter(|f| *f == &norm || f.ends_with(suffix.as_str()))
+        .collect();
+    // Bare filename? Match by file name as a last resort.
+    if hits.is_empty() && !norm.contains('/') {
+        hits = files
+            .iter()
+            .filter(|f| {
+                Path::new(f)
+                    .file_name()
+                    .map(|n| n.to_string_lossy() == norm)
+                    .unwrap_or(false)
+            })
+            .collect();
+    }
+    match hits.len() {
+        1 => Ok(hits[0].clone()),
+        0 => {
+            let hint = suggest_similar(&files, &norm);
+            bail!(
+                "file `{raw}` does not exist in the repo; use an EXACT repo-relative path.{hint}"
+            )
+        }
+        _ => {
+            let list: Vec<&str> = hits.iter().take(5).map(|s| s.as_str()).collect();
+            bail!(
+                "path `{raw}` is ambiguous; multiple repo files match. \
+                 Use the exact one: {}",
+                list.join(", ")
+            )
+        }
+    }
+}
+
+/// Small hint for missing-file errors: same file name elsewhere, else a few
+/// top-level files so the model sees real paths.
+fn suggest_similar(files: &[String], norm: &str) -> String {
+    let want_name = Path::new(norm)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned());
+    let same_name: Vec<&str> = files
+        .iter()
+        .filter(|f| {
+            want_name.as_ref().is_some_and(|w| {
+                Path::new(f)
+                    .file_name()
+                    .map(|n| n.to_string_lossy() == *w)
+                    .unwrap_or(false)
+            })
+        })
+        .take(5)
+        .map(|s| s.as_str())
+        .collect();
+    if !same_name.is_empty() {
+        return format!(" Did you mean one of: {}?", same_name.join(", "));
+    }
+    let top: Vec<&str> = files
+        .iter()
+        .filter(|f| !f.contains('/'))
+        .take(8)
+        .map(|s| s.as_str())
+        .collect();
+    if !top.is_empty() {
+        return format!(" Repo top-level files include: {}.", top.join(", "));
+    }
+    String::new()
+}
+
 /// Outcome of applying an edit set, used by selection to prefer smaller diffs.
 #[derive(Debug, Default, Clone)]
 pub struct ApplyReport {
     pub files_changed: BTreeMap<String, ChangeKind>,
     /// Total lines emitted in replace bodies (a cheap diff-size proxy).
     pub touched_lines: usize,
+    /// Model-emitted path -> canonical repo path, when resolution rewrote one.
+    /// Surfaced in the UI so path fixes are visible, not silent.
+    pub resolved_paths: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,11 +446,31 @@ pub fn compute_changes(root: &Path, blocks: &[EditBlock]) -> Result<Changes> {
     if blocks.is_empty() {
         bail!("no edit blocks found in model output");
     }
+    // Resolve every model-emitted path to its canonical repo-relative form
+    // FIRST, so scope checks, sandbox writes, ledger records, and the final
+    // apply all see the same real path (never `path/to/...` junk).
+    let mut resolved: Vec<EditBlock> = Vec::with_capacity(blocks.len());
+    let mut remapped: Vec<(String, String)> = Vec::new();
+    for b in blocks {
+        let canon = resolve_model_path(root, &b.path, b.search.trim().is_empty())?;
+        if canon != b.path {
+            remapped.push((b.path.clone(), canon.clone()));
+        }
+        resolved.push(EditBlock {
+            path: canon,
+            search: b.search.clone(),
+            replace: b.replace.clone(),
+        });
+    }
+
     let mut contents: BTreeMap<String, String> = BTreeMap::new();
     let mut existed: BTreeMap<String, bool> = BTreeMap::new();
-    let mut report = ApplyReport::default();
+    let mut report = ApplyReport {
+        resolved_paths: remapped,
+        ..Default::default()
+    };
 
-    for b in blocks {
+    for b in &resolved {
         let abs = safe_join(root, &b.path)?;
         let current = if let Some(c) = contents.get(&b.path) {
             c.clone()
@@ -453,5 +706,102 @@ done.";
     fn fallback_none_without_default_path() {
         let text = "```\nsome code\n```";
         assert!(parse_blocks_fallback(text, None).is_empty());
+    }
+
+    #[test]
+    fn placeholder_path_rejected_with_actionable_error() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("solution.py"), "x = 1\n").unwrap();
+        for bad in [
+            "path/to/solution.py",
+            "path\\to\\solution.py",
+            "<solution.py>",
+            "example.py",
+            "file.ext",
+        ] {
+            let blocks = vec![EditBlock {
+                path: bad.into(),
+                search: "x = 1".into(),
+                replace: "x = 2".into(),
+            }];
+            let err = compute_changes(dir.path(), &blocks).unwrap_err().to_string();
+            assert!(
+                err.contains("placeholder") || err.contains("EXACT"),
+                "path `{bad}` gave weak error: {err}"
+            );
+        }
+        // ...and nothing was written to disk.
+        assert!(!dir.path().join("path").exists());
+    }
+
+    #[test]
+    fn backslash_and_dot_slash_paths_normalized() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn a() {}\n").unwrap();
+        for raw in ["src\\main.rs", "./src/main.rs", "src//main.rs"] {
+            let canon = resolve_model_path(dir.path(), raw, false).unwrap();
+            assert_eq!(canon, "src/main.rs", "raw: {raw}");
+        }
+    }
+
+    #[test]
+    fn missing_file_errors_with_hint() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("solution.py"), "x = 1\n").unwrap();
+        let blocks = vec![EditBlock {
+            path: "totally_missing.py".into(),
+            search: "x".into(),
+            replace: "y".into(),
+        }];
+        let err = compute_changes(dir.path(), &blocks).unwrap_err().to_string();
+        assert!(err.contains("does not exist"), "weak error: {err}");
+    }
+
+    #[test]
+    fn directory_path_rejected() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("pkg")).unwrap();
+        let blocks = vec![EditBlock {
+            path: "pkg/".into(),
+            search: "x".into(),
+            replace: "y".into(),
+        }];
+        assert!(compute_changes(dir.path(), &blocks).is_err());
+    }
+
+    #[test]
+    fn ambiguous_suffix_errors_with_candidates() {
+        let dir = tempdir().unwrap();
+        // Neither candidate matches exactly; the raw trailing path is
+        // intentionally not a suffix of either, forcing ambiguity via
+        // bare-name match is impossible here, so craft: two files share the
+        // name and the model path matches both by suffix.
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        std::fs::write(dir.path().join("a/solution.py"), "x = 1\n").unwrap();
+        std::fs::write(dir.path().join("b/solution.py"), "x = 1\n").unwrap();
+        let blocks = vec![EditBlock {
+            path: "solution.py".into(),
+            search: "x = 1".into(),
+            replace: "x = 2".into(),
+        }];
+        let err = compute_changes(dir.path(), &blocks).unwrap_err().to_string();
+        assert!(err.contains("ambiguous"), "weak error: {err}");
+    }
+
+    #[test]
+    fn create_new_nested_file_still_works() {
+        let dir = tempdir().unwrap();
+        let blocks = vec![EditBlock {
+            path: "pkg/new_mod.py".into(),
+            search: "".into(),
+            replace: "X = 1".into(),
+        }];
+        let rep = apply_blocks(dir.path(), &blocks).unwrap();
+        assert_eq!(
+            rep.files_changed.get("pkg/new_mod.py"),
+            Some(&ChangeKind::Created)
+        );
     }
 }

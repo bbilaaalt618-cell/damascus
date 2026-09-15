@@ -48,8 +48,17 @@ impl ChatProvider for MockProvider {
 
         // Planner: asked for a JSON array of steps.
         if user.contains("Reply with ONLY a JSON array") {
-            let json = r#"[{"title":"add greeting function","detail":"create greet.txt","check":"grep -q 'hello world' greet.txt"}]"#;
-            return Box::pin(async move { Ok(json.to_string()) });
+            // Acceptance check must run on every OS (`cmd /C` on Windows,
+            // `sh -c` elsewhere — see `verify::shell_command`).
+            let check = if cfg!(windows) {
+                "findstr hello greet.txt"
+            } else {
+                "grep -q 'hello world' greet.txt"
+            };
+            let json = format!(
+                r#"[{{"title":"add greeting function","detail":"create greet.txt","check":"{check}"}}]"#
+            );
+            return Box::pin(async move { Ok(json) });
         }
 
         // Judge tie-break: "Reply with ONLY the integer index".
@@ -82,6 +91,8 @@ impl ChatProvider for MockProvider {
 }
 
 fn test_config(candidates: usize, repair_rounds: usize) -> Config {
+    // No-op build gate on every OS.
+    let build = if cfg!(windows) { "exit 0" } else { "true" };
     let toml = format!(
         r#"
 [providers.mock]
@@ -102,7 +113,7 @@ temperature = 0.3
 temperature_step = 0.2
 
 [verify]
-build = "true"
+build = "{build}"
 timeout_secs = 30
 "#
     );

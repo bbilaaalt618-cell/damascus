@@ -30,9 +30,8 @@ pub fn repo_summary(root: &Path) -> String {
         .filter_map(|e| e.ok())
     {
         if entry.file_type().is_file() {
-            if let Ok(rel) = entry.path().strip_prefix(root) {
-                files.push(rel.to_string_lossy().to_string());
-            }
+            // Forward slashes on every OS (see `crate::rel_forward`).
+            files.push(crate::rel_forward(root, entry.path()));
         }
         if files.len() >= MAX_LISTED {
             files.push("… (truncated)".to_string());
