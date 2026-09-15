@@ -23,3 +23,20 @@ pub mod slice;
 pub mod tree;
 pub mod ui;
 pub mod verify;
+
+use std::path::Path;
+
+/// Repo-relative path with forward slashes on every OS.
+///
+/// `Path::to_string_lossy` yields backslashes on Windows, which then leak
+/// into prompts, contracts, and test expectations. Canonicalizing once —
+/// everywhere a repo-relative path is stringified — keeps prompts, scope
+/// checks, and path resolution (`edits::resolve_model_path`) consistent.
+pub fn rel_forward(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}

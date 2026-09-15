@@ -5,7 +5,7 @@ use crate::plan::Step;
 
 pub const EDIT_FORMAT: &str = r#"Output ONLY search/replace edit blocks, no prose. For each file:
 
-path/to/file.ext
+solution.py
 <<<<<<< SEARCH
 exact existing lines to find (leave EMPTY to create a new file)
 =======
@@ -13,6 +13,10 @@ the replacement lines
 >>>>>>> REPLACE
 
 Rules:
+- First line is the EXACT repo-relative path of the target file, copied
+  verbatim from the context (e.g. `solution.py`, `src/main.rs`). NEVER invent
+  paths and NEVER write placeholders like `path/to/...`, `<file>`, or
+  `example.*` — such blocks are rejected.
 - SEARCH text must match the current file EXACTLY (copy it verbatim).
 - To create a new file, leave the SEARCH section empty and put full contents in REPLACE.
 - Keep edits minimal and focused on the task. Do not reformat untouched code.
@@ -40,7 +44,7 @@ Repository overview:
 Break this into ordered steps. Reply with ONLY a JSON array, no prose:
 
 [
-  {{"title": "short imperative", "detail": "what to change and why, concretely", "check": "shell command or null", "file": "path/to/file or null", "symbol": "function_or_type_name or null"}}
+  {{"title": "short imperative", "detail": "what to change and why, concretely", "check": "shell command or null", "file": "exact repo-relative path or null", "symbol": "function_or_type_name or null"}}
 ]
 
 Rules:

@@ -69,12 +69,8 @@ impl RepoIndex {
             if source.len() > 400_000 {
                 continue; // skip pathologically large files
             }
-            let rel = entry
-                .path()
-                .strip_prefix(root)
-                .unwrap_or(entry.path())
-                .to_string_lossy()
-                .to_string();
+            // Forward slashes on every OS (see `crate::rel_forward`).
+            let rel = crate::rel_forward(root, entry.path());
             let syms = ast::symbols(lang, &source);
             for (i, s) in syms.iter().enumerate() {
                 by_name

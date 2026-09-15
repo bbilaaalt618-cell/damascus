@@ -332,26 +332,43 @@ impl<'a> Orchestrator<'a> {
                         if let Prefilter::Pass(changes) =
                             self.run_prefilter(&cand.candidate.blocks, &contract)
                         {
-                            if self
-                                .verify_changes(step, &changes)
-                                .await
-                                .map(|v| v.passed)
-                                .unwrap_or(false)
-                            {
-                                if let Err(e) = apply_blocks(&self.root, &cand.candidate.blocks) {
-                                    return StepStatus::Failed {
-                                        reason: format!("applying winner: {e}"),
+                            // Surface path fixes the resolver applied (e.g.
+                            // `path/to/x` → `x`) so corrections are visible.
+                            for (from, to) in &changes.report.resolved_paths {
+                                self.ui.dim(&format!("  path resolved: {from} → {to}"));
+                            }
+                            // The fresh confirmation verdict authorizes the
+                            // apply, so its summary (not the stale collect
+                            // verdict's) is what gets recorded.
+                            match self.verify_changes(step, &changes).await {
+                                Ok(fresh) if fresh.passed => {
+                                    if let Err(e) =
+                                        apply_blocks(&self.root, &cand.candidate.blocks)
+                                    {
+                                        return StepStatus::Failed {
+                                            reason: format!("applying winner: {e}"),
+                                        };
+                                    }
+                                    changed.extend(changes.contents.keys().cloned());
+                                    return StepStatus::Success {
+                                        gates: fresh.summary(),
+                                        candidates: tried,
+                                        repairs: 0,
                                     };
                                 }
-                                changed.extend(changes.contents.keys().cloned());
-                                return StepStatus::Success {
-                                    gates: cand.verdict.summary(),
-                                    candidates: tried,
-                                    repairs: 0,
-                                };
+                                Ok(fresh) => {
+                                    self.ui.dim(&format!(
+                                        "  winner failed confirmation re-verify ({}); trying next",
+                                        fresh.summary()
+                                    ));
+                                }
+                                Err(e) => {
+                                    self.ui.dim(&format!(
+                                        "  winner failed confirmation re-verify ({}); trying next",
+                                        truncate(&e.to_string(), 120)
+                                    ));
+                                }
                             }
-                            self.ui
-                                .dim("  winner failed confirmation re-verify; trying next");
                         }
                     }
                     (
@@ -405,6 +422,9 @@ impl<'a> Orchestrator<'a> {
                         continue;
                     }
                 };
+                for (from, to) in &changes.report.resolved_paths {
+                    self.ui.dim(&format!("  path resolved: {from} → {to}"));
+                }
                 match self.verify_changes(step, &changes).await {
                     Ok(verdict) if verdict.passed => {
                         self.ui.candidate(0, true, &verdict.summary());

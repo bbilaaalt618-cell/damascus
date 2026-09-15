@@ -37,13 +37,20 @@ pub struct Verdict {
 
 impl Verdict {
     /// Compact human summary, e.g. `build:ok test:FAIL lint:ok`.
+    /// Never empty: `nogates` signals that nothing actually ran, which is
+    /// always worth surfacing instead of a silent blank.
     pub fn summary(&self) -> String {
-        self.gates
+        let s: Vec<String> = self
+            .gates
             .iter()
             .filter(|g| g.ran)
             .map(|g| format!("{}:{}", g.name, if g.passed { "ok" } else { "FAIL" }))
-            .collect::<Vec<_>>()
-            .join(" ")
+            .collect();
+        if s.is_empty() {
+            "nogates".to_string()
+        } else {
+            s.join(" ")
+        }
     }
 
     /// The output of the first failing gate, for repair feedback.
@@ -90,10 +97,8 @@ pub async fn verify(dir: &Path, cfg: &VerifyConfig, acceptance: Option<&str>) ->
 }
 
 async fn run_gate(name: &str, command: &str, dir: &Path, dur: Duration) -> GateResult {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(dir)
+    let mut cmd = shell_command(command);
+    cmd.current_dir(dir)
         .stdin(Stdio::null())
         .kill_on_drop(true)
         .stdout(Stdio::piped())
@@ -166,6 +171,24 @@ async fn run_gate(name: &str, command: &str, dir: &Path, dur: Duration) -> GateR
     }
 }
 
+/// Platform shell for gate commands: `cmd /C` on Windows, `sh -c` elsewhere.
+/// Previously hard-coded to `sh`, which silently broke every gate on stock
+/// Windows machines (no `sh` without Git/MSYS installed).
+#[cfg(windows)]
+fn shell_command(command: &str) -> Command {
+    let mut cmd = Command::new("cmd");
+    cmd.arg("/C").arg(command);
+    cmd
+}
+
+/// Platform shell for gate commands: `cmd /C` on Windows, `sh -c` elsewhere.
+#[cfg(not(windows))]
+fn shell_command(command: &str) -> Command {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(command);
+    cmd
+}
+
 fn tail(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -193,12 +216,40 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// Cross-platform shell snippets (`cmd /C ...` on Windows, `sh -c ...`
+    /// elsewhere — see `shell_command`), so the suite passes on every OS.
+    #[cfg(windows)]
+    fn ok_cmd() -> &'static str {
+        "exit 0"
+    }
+    #[cfg(not(windows))]
+    fn ok_cmd() -> &'static str {
+        "true"
+    }
+    #[cfg(windows)]
+    fn fail_cmd() -> &'static str {
+        "echo boom 1>&2 & exit 1"
+    }
+    #[cfg(not(windows))]
+    fn fail_cmd() -> &'static str {
+        "echo boom >&2; false"
+    }
+    #[cfg(windows)]
+    fn sleep_cmd() -> &'static str {
+        // NOTE: `timeout.exe` refuses redirected stdin, so `ping` is used.
+        "ping -n 6 127.0.0.1 >NUL"
+    }
+    #[cfg(not(windows))]
+    fn sleep_cmd() -> &'static str {
+        "sleep 5"
+    }
+
     #[tokio::test]
     async fn passing_gate() {
         let dir = tempdir().unwrap();
         let cfg = VerifyConfig {
-            build: Some("true".into()),
-            test: Some("true".into()),
+            build: Some(ok_cmd().into()),
+            test: Some(ok_cmd().into()),
             lint: None,
             timeout_secs: 10,
         };
@@ -211,8 +262,8 @@ mod tests {
     async fn failing_gate_blocks() {
         let dir = tempdir().unwrap();
         let cfg = VerifyConfig {
-            build: Some("true".into()),
-            test: Some("echo boom >&2; false".into()),
+            build: Some(ok_cmd().into()),
+            test: Some(fail_cmd().into()),
             lint: None,
             timeout_secs: 10,
         };
@@ -226,11 +277,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg = VerifyConfig {
             build: None,
-            test: Some("false".into()),
+            test: Some(fail_cmd().into()),
             lint: None,
             timeout_secs: 10,
         };
-        let v = verify(dir.path(), &cfg, Some("true")).await;
+        let v = verify(dir.path(), &cfg, Some(ok_cmd())).await;
         assert!(v.passed);
         assert_eq!(v.summary(), "check:ok");
     }
@@ -239,7 +290,7 @@ mod tests {
     async fn timeout_is_recorded() {
         let dir = tempdir().unwrap();
         let cfg = VerifyConfig {
-            build: Some("sleep 5".into()),
+            build: Some(sleep_cmd().into()),
             test: None,
             lint: None,
             timeout_secs: 1,
